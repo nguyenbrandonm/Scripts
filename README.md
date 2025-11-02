@@ -1,2 +1,2 @@
-# Quick-Scripts
+# Scripts
 Scripts to automate tasks.
