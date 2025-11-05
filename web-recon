@@ -1,8 +1,7 @@
+#!/bin/bash
 # Bash script that enumerates subdomains, probes for alive hosts, takes screenshots of  them, and runs nmap
 # if you want to use amass delete the hashtags
 # Usage: ./recon.sh <example.com>
-
-#!/bin/bash
 
 domain=$1
 RED="\033[1;31m"
