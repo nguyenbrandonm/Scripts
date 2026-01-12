@@ -1,6 +1,9 @@
 #!/bin/bash
-# Bash script that enumerates subdomains, probes for alive hosts, takes screenshots of them, and runs nmap
-# if you want to use amass delete the hashtags
+# web-recon: End-to-end web reconnaissance automation.
+# Combines subdomain discovery, live host probing, screenshot capture,
+# and service enumeration to quickly identify and prioritize exposed
+# web assets during security assessments.
+
 # Usage: ./recon.sh <example.com>
 
 domain=$1
