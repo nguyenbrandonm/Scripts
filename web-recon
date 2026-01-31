@@ -1,0 +1,89 @@
+#!/bin/bash
+set -euo pipefail
+
+# web-recon: End-to-end web reconnaissance automation.
+# Usage: ./recon.sh <example.com>
+
+domain="${1:-}"
+
+RED="\033[1;31m"
+RESET="\033[0m"
+
+if [[ -z "$domain" ]]; then
+  echo -e "${RED}Usage:${RESET} $0 <example.com>"
+  exit 1
+fi
+
+subdomain_path="$domain/subdomains"
+screenshot_path="$domain/screenshots"
+scan_path="$domain/scans"
+
+mkdir -p "$subdomain_path" "$screenshot_path" "$scan_path"
+
+# ---- dependency checks (fail early) ----
+req_bins=(subfinder assetfinder httprobe nmap)
+for b in "${req_bins[@]}"; do
+  command -v "$b" >/dev/null 2>&1 || {
+    echo -e "${RED}[!] Missing dependency:${RESET} $b"
+    exit 1
+  }
+done
+
+# EyeWitness: you may have it as "eyewitness" or as "EyeWitness.py"
+EYEWITNESS_BIN=""
+if command -v eyewitness >/dev/null 2>&1; then
+  EYEWITNESS_BIN="eyewitness"
+elif [[ -f "/opt/EyeWitness/Python/EyeWitness.py" ]]; then
+  EYEWITNESS_BIN="python3 /opt/EyeWitness/Python/EyeWitness.py"
+elif [[ -f "./EyeWitness.py" ]]; then
+  EYEWITNESS_BIN="python3 ./EyeWitness.py"
+else
+  echo -e "${RED}[!] EyeWitness not found.${RESET}"
+  echo "  Install it or set the path in the script."
+  echo "  Common path: /opt/EyeWitness/Python/EyeWitness.py"
+  exit 1
+fi
+
+found="$subdomain_path/found.txt"
+alive_urls="$subdomain_path/alive_urls.txt"
+alive_hosts="$subdomain_path/alive_hosts.txt"
+
+# ---- subdomain discovery ----
+echo -e "${RED}[+] Launching subfinder ...${RESET}"
+subfinder -d "$domain" > "$found"
+
+echo -e "${RED}[+] Launching assetfinder ...${RESET}"
+assetfinder "$domain" | grep -F "$domain" >> "$found"
+
+# Optional:
+# echo -e "${RED}[+] Launching amass ...${RESET}"
+# amass enum -d "$domain" >> "$found"
+
+# ---- alive probing ----
+echo -e "${RED}[+] Finding alive subdomains ...${RESET}"
+sort -u "$found" \
+  | grep -F "$domain" \
+  | httprobe -s -p https:443 -p http:80 \
+  | sort -u > "$alive_urls"
+
+# Build hosts file for nmap (strip scheme and optional :port)
+sed -E 's#^https?://##; s#:[0-9]+$##' "$alive_urls" \
+  | sort -u > "$alive_hosts"
+
+echo -e "${RED}[+] Alive URLs:${RESET} $(wc -l < "$alive_urls")"
+echo -e "${RED}[+] Alive Hosts:${RESET} $(wc -l < "$alive_hosts")"
+
+# ---- screenshots via EyeWitness ----
+echo -e "${RED}[+] Taking screenshots of alive subdomains (EyeWitness) ...${RESET}"
+$EYEWITNESS_BIN --web -f "$alive_urls" -d "$screenshot_path" --no-prompt
+
+# ---- nmap ----
+echo -e "${RED}[+] Running nmap on alive subdomains ...${RESET}"
+sudo nmap -T4 -p- -A -iL "$alive_hosts" -oG "$scan_path/nmap.txt"
+
+echo -e "${RED}[+] Done.${RESET}"
+echo "  Subdomains:  $found"
+echo "  Alive URLs:  $alive_urls"
+echo "  Alive Hosts: $alive_hosts"
+echo "  Screenshots: $screenshot_path"
+echo "  Nmap output: $scan_path/nmap.txt"
