@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Generates common seasonal password patterns for testing (e.g., Spring2025, Winter24!, Password1)
 
 for x in 1 24 25 26; do
