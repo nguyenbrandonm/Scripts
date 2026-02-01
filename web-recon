@@ -1,89 +1,483 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# web-recon: End-to-end web reconnaissance automation.
-# Usage: ./recon.sh <example.com>
+# web-recon: subdomains -> DNS validate -> probe -> screenshots -> web scan (nikto) -> nmap
+# Keeps ONLY final actionable outputs. Intermediate files go to a temp dir and are deleted.
+#
+# Usage: ./web-recon example.com [options]
+#
+# Options:
+#   -o, --out DIR         Output directory (default: ./<domain>)
+#   -t, --threads N       Concurrency for probing/resolve where supported (default: 80)
+#   -p, --ports "..."     Ports for probing (ProjectDiscovery httpx only). Default: 80,443,8080,8443
+#   --timeout SEC         Probe/screenshot timeout (default: 12)
+#   --force               Re-run steps even if output files already exist
+#   --no-screens          Skip screenshots
+#   --no-nmap             Skip nmap
+#   --no-webscan          Skip web scan (nikto)
+#   --full-nmap           Heavier nmap (slower/noisier)
+#   --debug               Verbose debug output
+#
+# Notes:
+# - If ProjectDiscovery httpx is not present, script falls back to httprobe.
+# - Your system currently has Python httpx (/usr/bin/httpx). That is NOT PD httpx.
 
-domain="${1:-}"
+# -------------------- defaults --------------------
+DOMAIN=""
+OUTDIR=""
+THREADS=80
+PORTS="80,443,8080,8443"
+TIMEOUT=12
+FORCE=0
+DO_SCREENS=1
+DO_NMAP=1
+DO_WEBSCAN=1
+FULL_NMAP=0
+DEBUG=0
 
 RED="\033[1;31m"
-RESET="\033[0m"
+GRN="\033[1;32m"
+YLW="\033[1;33m"
+BLU="\033[1;34m"
+RST="\033[0m"
 
-if [[ -z "$domain" ]]; then
-  echo -e "${RED}Usage:${RESET} $0 <example.com>"
-  exit 1
-fi
+usage() { sed -n '1,130p' "$0" | sed 's/^# \{0,1\}//'; }
+log()   { echo -e "${GRN}[+]${RST} $*"; }
+warn()  { echo -e "${YLW}[!]${RST} $*"; }
+err()   { echo -e "${RED}[-]${RST} $*" >&2; }
+phase() { echo; echo -e "${BLU}========== $* ==========${RST}"; }
 
-subdomain_path="$domain/subdomains"
-screenshot_path="$domain/screenshots"
-scan_path="$domain/scans"
+have() { command -v "$1" >/dev/null 2>&1; }
 
-mkdir -p "$subdomain_path" "$screenshot_path" "$scan_path"
+run() {
+  if [[ "$DEBUG" == "1" ]]; then
+    echo -e "${YLW}[cmd]${RST} $*" >&2
+  fi
+  "$@"
+}
 
-# ---- dependency checks (fail early) ----
-req_bins=(subfinder assetfinder httprobe nmap)
-for b in "${req_bins[@]}"; do
-  command -v "$b" >/dev/null 2>&1 || {
-    echo -e "${RED}[!] Missing dependency:${RESET} $b"
+die_usage() { err "$1"; echo; usage; exit 1; }
+
+step_should_run() {
+  local outfile="$1"
+  [[ "$FORCE" == "1" ]] && return 0
+  [[ ! -s "$outfile" ]]
+}
+
+count_lines() { [[ -s "$1" ]] && wc -l < "$1" || echo 0; }
+
+normalize_urls() {
+  sed -E '
+    s#^http://([^/]+):443$#https://\1#;
+    s#^https://([^/]+):80$#http://\1#;
+    s#/$##;
+  ' | sort -u
+}
+
+prefer_https() {
+  awk '
+    {
+      u=$0
+      tmp=u
+      sub(/^https?:\/\//,"",tmp)
+      sub(/\/.*$/,"",tmp)
+      sub(/:[0-9]+$/,"",tmp)
+      host=tmp
+      if (u ~ /^https:\/\//) https[host]=u
+      else if (!(host in http)) http[host]=u
+    }
+    END{
+      for (h in https) print https[h]
+      for (h in http) if (!(h in https)) print http[h]
+    }' | sort -u
+}
+
+pipe_with_progress() {
+  local f="$1"
+  if have pv; then
+    pv -l -s "$(count_lines "$f")" "$f"
+  else
+    cat "$f"
+  fi
+}
+
+# --- ProjectDiscovery httpx detection ---
+# Sets PD_HTTPX to a usable binary if found (supports -l), otherwise empty.
+find_pd_httpx() {
+  PD_HTTPX=""
+
+  local candidates=()
+
+  # Common locations
+  [[ -x "/usr/bin/httpx" ]] && candidates+=("/usr/bin/httpx")
+  [[ -x "/usr/local/bin/httpx" ]] && candidates+=("/usr/local/bin/httpx")
+  [[ -x "$HOME/go/bin/httpx" ]] && candidates+=("$HOME/go/bin/httpx")
+  have httpx && candidates+=("httpx")
+
+  # Dedup
+  local seen=""
+  local uniq=()
+  for c in "${candidates[@]}"; do
+    [[ " $seen " == *" $c "* ]] && continue
+    seen+=" $c"
+    uniq+=("$c")
+  done
+
+  for c in "${uniq[@]}"; do
+    if "$c" -h 2>/dev/null | grep -qE '(^|\s)-l(\s|,)|(^|\s)-list(\s|,)' ; then
+      PD_HTTPX="$c"
+      return 0
+    fi
+    if "$c" -help 2>/dev/null | grep -qE '(^|\s)-l(\s|,)|(^|\s)-list(\s|,)' ; then
+      PD_HTTPX="$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Preflight dependency check
+preflight() {
+  phase "Preflight: dependency check"
+
+  local missing=0
+
+  # Required
+  for b in subfinder assetfinder; do
+    if have "$b"; then
+      log "Found: $b ($(command -v "$b"))"
+    else
+      err "Missing REQUIRED: $b"
+      missing=1
+    fi
+  done
+
+  # DNS validation (recommended)
+  if have dnsx; then
+    HAVE_DNSX=1
+    log "Found: dnsx ($(command -v dnsx))"
+  else
+    HAVE_DNSX=0
+    warn "Missing: dnsx (recommended for accurate subdomain validation)"
+  fi
+
+  # Prober (required: PD httpx OR httprobe)
+  PROBER=""
+  if find_pd_httpx; then
+    PROBER="pd-httpx"
+    log "Found: ProjectDiscovery httpx ($PD_HTTPX)"
+  else
+    # If python httpx exists, call out collision
+    if have httpx; then
+      warn "Non-PD 'httpx' detected at $(command -v httpx) (will be ignored)"
+      warn "Install PD httpx: sudo apt install httpx-toolkit OR go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    fi
+    if have httprobe; then
+      PROBER="httprobe"
+      log "Found: httprobe ($(command -v httprobe))"
+    else
+      err "Missing REQUIRED: either ProjectDiscovery httpx OR httprobe"
+      missing=1
+    fi
+  fi
+
+  # Optional: pv
+  if have pv; then
+    HAVE_PV=1
+    log "Found: pv ($(command -v pv))"
+  else
+    HAVE_PV=0
+    warn "Missing: pv (optional; enables progress bars)"
+  fi
+
+  # Screenshot tool
+  EYEWITNESS_CMD=""
+  if [[ "$DO_SCREENS" == "1" ]]; then
+    if have eyewitness; then
+      EYEWITNESS_CMD="eyewitness"
+      log "Found: EyeWitness (eyewitness)"
+    elif [[ -f "/opt/EyeWitness/Python/EyeWitness.py" ]]; then
+      EYEWITNESS_CMD="python3 /opt/EyeWitness/Python/EyeWitness.py"
+      log "Found: EyeWitness (/opt/EyeWitness/Python/EyeWitness.py)"
+    elif [[ -f "./EyeWitness.py" ]]; then
+      EYEWITNESS_CMD="python3 ./EyeWitness.py"
+      log "Found: EyeWitness (./EyeWitness.py)"
+    elif have gowitness; then
+      EYEWITNESS_CMD="gowitness"
+      warn "EyeWitness not found; using gowitness instead ($(command -v gowitness))"
+    else
+      warn "No screenshot tool found; screenshots will be skipped"
+      DO_SCREENS=0
+    fi
+  fi
+
+  # Web scan tool
+  if [[ "$DO_WEBSCAN" == "1" ]]; then
+    if have nikto; then
+      HAVE_NIKTO=1
+      log "Found: nikto ($(command -v nikto))"
+    else
+      HAVE_NIKTO=0
+      warn "Missing: nikto; web scan will be skipped"
+      DO_WEBSCAN=0
+    fi
+  fi
+
+  # Nmap
+  if [[ "$DO_NMAP" == "1" ]]; then
+    if have nmap; then
+      HAVE_NMAP=1
+      log "Found: nmap ($(command -v nmap))"
+    else
+      HAVE_NMAP=0
+      warn "Missing: nmap; network scan will be skipped"
+      DO_NMAP=0
+    fi
+  fi
+
+  if [[ "$missing" == "1" ]]; then
+    err "Preflight failed: missing required dependencies."
     exit 1
-  }
+  fi
+
+  log "Preflight OK."
+}
+
+# -------------------- arg parsing --------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUTDIR="${2:-}"; shift 2;;
+    -t|--threads) THREADS="${2:-}"; shift 2;;
+    -p|--ports) PORTS="${2:-}"; shift 2;;
+    --timeout) TIMEOUT="${2:-}"; shift 2;;
+    --force) FORCE=1; shift;;
+    --no-screens) DO_SCREENS=0; shift;;
+    --no-nmap) DO_NMAP=0; shift;;
+    --no-webscan) DO_WEBSCAN=0; shift;;
+    --full-nmap) FULL_NMAP=1; shift;;
+    --debug) DEBUG=1; shift;;
+    -h|--help) usage; exit 0;;
+    -*) die_usage "Unknown option: $1";;
+    *)
+      if [[ -z "$DOMAIN" ]]; then DOMAIN="$1"; shift
+      else die_usage "Unexpected argument: $1"
+      fi
+      ;;
+  esac
 done
 
-# EyeWitness: you may have it as "eyewitness" or as "EyeWitness.py"
-EYEWITNESS_BIN=""
-if command -v eyewitness >/dev/null 2>&1; then
-  EYEWITNESS_BIN="eyewitness"
-elif [[ -f "/opt/EyeWitness/Python/EyeWitness.py" ]]; then
-  EYEWITNESS_BIN="python3 /opt/EyeWitness/Python/EyeWitness.py"
-elif [[ -f "./EyeWitness.py" ]]; then
-  EYEWITNESS_BIN="python3 ./EyeWitness.py"
+[[ -z "$DOMAIN" ]] && die_usage "Missing domain."
+
+# -------------------- final output paths --------------------
+OUTDIR="${OUTDIR:-$PWD/$DOMAIN}"
+mkdir -p "$OUTDIR"
+
+SCREEN_DIR="$OUTDIR/screenshots"
+SCAN_DIR="$OUTDIR/scans"
+mkdir -p "$SCREEN_DIR" "$SCAN_DIR"
+
+FINAL_SUBS="$OUTDIR/subdomains.txt"
+ALIVE_URLS="$OUTDIR/alive_urls.txt"
+SCREEN_URLS="$OUTDIR/screenshot_urls.txt"
+ALIVE_HOSTS="$OUTDIR/alive_hosts.txt"
+
+# -------------------- temp workspace (auto-cleaned) --------------------
+WORKDIR="$(mktemp -d -t webrecon.XXXXXX)"
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+SUBF_TXT="$WORKDIR/subfinder.txt"
+ASSET_TXT="$WORKDIR/assetfinder.txt"
+SUBS_ALL="$WORKDIR/subdomains_all.txt"
+HTTPX_META="$WORKDIR/httpx_meta.txt"
+
+# -------------------- header --------------------
+log "Target: $DOMAIN"
+log "Output: $OUTDIR"
+log "Threads: $THREADS"
+log "Timeout: ${TIMEOUT}s"
+
+# -------------------- preflight --------------------
+preflight
+
+# -------------------- Phase 1: Subdomain discovery --------------------
+phase "Phase 1/5: Subdomain discovery"
+if step_should_run "$FINAL_SUBS"; then
+  log "Running subfinder..."
+  run subfinder -d "$DOMAIN" -silent > "$SUBF_TXT"
+
+  log "Running assetfinder..."
+  run assetfinder --subs-only "$DOMAIN" > "$ASSET_TXT"
+
+  log "Combining + deduplicating..."
+  cat "$SUBF_TXT" "$ASSET_TXT" \
+    | sed 's/[[:space:]]//g' \
+    | grep -F ".$DOMAIN" \
+    | sort -u > "$SUBS_ALL"
+
+  log "Discovered subdomains: $(count_lines "$SUBS_ALL")"
+
+  if [[ "${HAVE_DNSX:-0}" == "1" ]]; then
+    log "Validating DNS with dnsx (filters to resolving names)..."
+    run dnsx -l "$SUBS_ALL" -silent -threads "$THREADS" | sort -u > "$FINAL_SUBS"
+  else
+    warn "dnsx not available; using discovered subdomains as final (may include dead/wildcard)."
+    cp "$SUBS_ALL" "$FINAL_SUBS"
+  fi
+
+  log "Final subdomains saved: $FINAL_SUBS ($(count_lines "$FINAL_SUBS"))"
 else
-  echo -e "${RED}[!] EyeWitness not found.${RESET}"
-  echo "  Install it or set the path in the script."
-  echo "  Common path: /opt/EyeWitness/Python/EyeWitness.py"
-  exit 1
+  log "Skipping (exists): $FINAL_SUBS ($(count_lines "$FINAL_SUBS"))"
 fi
 
-found="$subdomain_path/found.txt"
-alive_urls="$subdomain_path/alive_urls.txt"
-alive_hosts="$subdomain_path/alive_hosts.txt"
+# -------------------- Phase 2: HTTP probing --------------------
+phase "Phase 2/5: HTTP probing (live web services)"
+if step_should_run "$ALIVE_URLS"; then
+  log "Probing with: $PROBER"
 
-# ---- subdomain discovery ----
-echo -e "${RED}[+] Launching subfinder ...${RESET}"
-subfinder -d "$domain" > "$found"
+  if [[ "$PROBER" == "pd-httpx" ]]; then
+    if "$PD_HTTPX" -h 2>&1 | grep -q -- "-ports"; then
+      run "$PD_HTTPX" -l "$FINAL_SUBS" \
+        -silent -threads "$THREADS" \
+        -ports "$PORTS" \
+        -follow-redirects \
+        -timeout "$TIMEOUT" -retries 2 \
+        -o "$HTTPX_META"
+    else
+      warn "PD httpx doesn't support -ports; probing default (80/443)."
+      run "$PD_HTTPX" -l "$FINAL_SUBS" \
+        -silent -threads "$THREADS" \
+        -follow-redirects \
+        -timeout "$TIMEOUT" -retries 2 \
+        -o "$HTTPX_META"
+    fi
+    cut -d' ' -f1 "$HTTPX_META" | normalize_urls > "$ALIVE_URLS"
+  else
+    # Small lists finish instantly; pv may jump to 100% immediately. That's normal.
+    total="$(count_lines "$FINAL_SUBS")"
+    log "httprobe running on $total hosts..."
+    pipe_with_progress "$FINAL_SUBS" \
+      | httprobe -s -p https:443 -p http:80 \
+      | normalize_urls > "$ALIVE_URLS"
+  fi
 
-echo -e "${RED}[+] Launching assetfinder ...${RESET}"
-assetfinder "$domain" | grep -F "$domain" >> "$found"
+  log "Alive URLs saved: $ALIVE_URLS ($(count_lines "$ALIVE_URLS"))"
+else
+  log "Skipping (exists): $ALIVE_URLS ($(count_lines "$ALIVE_URLS"))"
+fi
 
-# Optional:
-# echo -e "${RED}[+] Launching amass ...${RESET}"
-# amass enum -d "$domain" >> "$found"
+# Build hosts list for nmap (strip scheme + port + path)
+if step_should_run "$ALIVE_HOSTS"; then
+  sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##' "$ALIVE_URLS" \
+    | sort -u > "$ALIVE_HOSTS"
+fi
+log "Alive hosts: $ALIVE_HOSTS ($(count_lines "$ALIVE_HOSTS"))"
 
-# ---- alive probing ----
-echo -e "${RED}[+] Finding alive subdomains ...${RESET}"
-sort -u "$found" \
-  | grep -F "$domain" \
-  | httprobe -s -p https:443 -p http:80 \
-  | sort -u > "$alive_urls"
+# Screenshot targets (prefer https per host)
+if step_should_run "$SCREEN_URLS"; then
+  prefer_https < "$ALIVE_URLS" > "$SCREEN_URLS"
+fi
+log "Screenshot targets: $SCREEN_URLS ($(count_lines "$SCREEN_URLS"))"
 
-# Build hosts file for nmap (strip scheme and optional :port)
-sed -E 's#^https?://##; s#:[0-9]+$##' "$alive_urls" \
-  | sort -u > "$alive_hosts"
+# -------------------- Phase 3: Screenshots --------------------
+phase "Phase 3/5: Screenshots"
+if [[ "$DO_SCREENS" == "1" ]]; then
+  log "Screenshot tool: $EYEWITNESS_CMD"
+  log "Screenshots output: $SCREEN_DIR"
 
-echo -e "${RED}[+] Alive URLs:${RESET} $(wc -l < "$alive_urls")"
-echo -e "${RED}[+] Alive Hosts:${RESET} $(wc -l < "$alive_hosts")"
+  if [[ "$EYEWITNESS_CMD" == "gowitness" ]]; then
+    run gowitness file -f "$SCREEN_URLS" -P "$SCREEN_DIR" --timeout "$TIMEOUT" || warn "gowitness returned non-zero (continuing)."
+  else
+    set +e
+    $EYEWITNESS_CMD --web -f "$SCREEN_URLS" -d "$SCREEN_DIR" --no-prompt
+    ec=$?
+    set -e
+    [[ $ec -ne 0 ]] && warn "EyeWitness returned non-zero ($ec). Some hosts may have timed out."
+  fi
+else
+  warn "Screenshots skipped."
+fi
 
-# ---- screenshots via EyeWitness ----
-echo -e "${RED}[+] Taking screenshots of alive subdomains (EyeWitness) ...${RESET}"
-$EYEWITNESS_BIN --web -f "$alive_urls" -d "$screenshot_path" --no-prompt
+# -------------------- Phase 4: Web scan (nikto) --------------------
+phase "Phase 4/5: Web scan (nikto)"
+if [[ "$DO_WEBSCAN" == "1" ]]; then
+  NIKTO_OUT="$SCAN_DIR/nikto.txt"
+  if step_should_run "$NIKTO_OUT"; then
+    log "Running nikto against $(count_lines "$SCREEN_URLS") targets"
+    log "Output: $NIKTO_OUT"
+    warn "Nikto can be slow/noisy. Ctrl+C is safe; partial results are still useful."
 
-# ---- nmap ----
-echo -e "${RED}[+] Running nmap on alive subdomains ...${RESET}"
-sudo nmap -T4 -p- -A -iL "$alive_hosts" -oG "$scan_path/nmap.txt"
+    set +e
+    run nikto -h "$SCREEN_URLS" \
+      -Display VPE \
+      -timeout "$TIMEOUT" \
+      -maxtime $(( TIMEOUT * 30 )) \
+      -ask no \
+      -output "$NIKTO_OUT"
+    ec=$?
+    set -e
 
-echo -e "${RED}[+] Done.${RESET}"
-echo "  Subdomains:  $found"
-echo "  Alive URLs:  $alive_urls"
-echo "  Alive Hosts: $alive_hosts"
-echo "  Screenshots: $screenshot_path"
-echo "  Nmap output: $scan_path/nmap.txt"
+    if [[ $ec -eq 130 ]]; then
+      warn "Nikto interrupted (Ctrl+C). Partial output saved to $NIKTO_OUT"
+    elif [[ $ec -ne 0 ]]; then
+      warn "Nikto returned non-zero ($ec). Some targets may have failed/timeouts. Output saved."
+    fi
+  else
+    log "Skipping (exists): $NIKTO_OUT"
+  fi
+else
+  warn "Web scan skipped."
+fi
+
+# -------------------- Phase 5: Nmap --------------------
+phase "Phase 5/5: Network scan (nmap)"
+if [[ "$DO_NMAP" == "1" ]]; then
+  NMAP_OUT="$SCAN_DIR/nmap.txt"
+  if step_should_run "$NMAP_OUT"; then
+    set +e
+    if [[ "$FULL_NMAP" == "1" ]]; then
+      log "Nmap FULL scan (slower/noisier). Output: $NMAP_OUT"
+      run sudo nmap -n --open -Pn -T4 -sC -sV -O \
+        --stats-every 10s \
+        -iL "$ALIVE_HOSTS" -oN "$NMAP_OUT"
+      ec=$?
+    else
+      log "Nmap quick web-ports scan (recommended). Output: $NMAP_OUT"
+      run sudo nmap -n --open -Pn -T4 \
+        -p 80,443,8080,8443,8000,8888,3000,5000 \
+        -sV --version-light \
+        --stats-every 10s \
+        -iL "$ALIVE_HOSTS" -oN "$NMAP_OUT"
+      ec=$?
+    fi
+    set -e
+
+    if [[ ${ec:-0} -eq 130 ]]; then
+      warn "Nmap interrupted (Ctrl+C). Partial output saved to $NMAP_OUT"
+    elif [[ ${ec:-0} -ne 0 ]]; then
+      warn "Nmap returned non-zero ($ec). Output saved; some hosts may not have been scanned."
+    fi
+  else
+    log "Skipping (exists): $NMAP_OUT"
+  fi
+else
+  warn "Nmap skipped."
+fi
+
+# -------------------- Summary --------------------
+phase "Completed"
+log "Final deliverables (only):"
+echo "  Subdomains:       $FINAL_SUBS ($(count_lines "$FINAL_SUBS"))"
+echo "  Alive URLs:       $ALIVE_URLS ($(count_lines "$ALIVE_URLS"))"
+echo "  Screenshot URLs:  $SCREEN_URLS ($(count_lines "$SCREEN_URLS"))"
+echo "  Alive Hosts:      $ALIVE_HOSTS ($(count_lines "$ALIVE_HOSTS"))"
+echo "  Screenshots dir:  $SCREEN_DIR/"
+echo "  Scans dir:        $SCAN_DIR/"
+
+# Tips only when actually missing / not used
+if [[ "${HAVE_PV:-0}" == "0" ]]; then
+  log "Tip: Install pv for nicer progress bars: sudo apt install pv"
+fi
+if [[ "${HAVE_DNSX:-0}" == "0" || "$PROBER" != "pd-httpx" ]]; then
+  log "Tip: Install dnsx + ProjectDiscovery httpx for cleaner probing: sudo apt install dnsx httpx-toolkit"
+fi
